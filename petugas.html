@@ -4,6 +4,11 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>FFM Petugas — PLN UP3 Jayapura</title>
+<link rel="manifest" href="./manifest.json">
+<meta name="theme-color" content="#0B1F3A">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="FFM Petugas">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -373,6 +378,9 @@ body {
         <span class="loc-icon">📍</span><div class="loc-name">Lapangan</div>
       </div>
     </div>
+    <div id="loc-hint" style="font-size:11px;color:var(--text-3);margin-top:10px;line-height:1.6;text-align:center">
+      🏢 <b>Kantor</b>: status mulai dari Standby — Perjalanan &amp; Aktif Bekerja terdeteksi otomatis via GPS saat berangkat.
+    </div>
   </div>
 
   <!-- Selfie -->
@@ -469,6 +477,7 @@ body {
       <span>Status aktif: <b id="status-label">Standby</b></span>
     </div>
     <div style="font-size:11px;color:var(--text-3);margin-top:8px;text-align:center">⚙️ Status berubah otomatis sesuai absensi &amp; deteksi GPS</div>
+    <div id="lokasi-mode-badge" style="display:none;margin-top:10px;font-size:11px;font-weight:700;text-align:center;padding:7px 10px;border-radius:var(--radius-xs);background:var(--ok-bg);color:var(--ok);border:1px solid rgba(14,161,91,0.3)"></div>
   </div>
 
   <!-- BANNER PERJALANAN TERDETEKSI -->
@@ -681,6 +690,14 @@ let currentStatus = 'Standby';
 let sendTimer = null;
 let lastPos = null;
 
+// ── Offline queue (blank spot / sinyal jelek) ────────────
+// Titik GPS & event status yang gagal terkirim disimpan di localStorage,
+// lalu otomatis dikirim ulang begitu koneksi internet kembali — tidak ada
+// data yang hilang walau petugas berjam-jam di area tanpa sinyal.
+const OFFLINE_QUEUE_KEY = 'ffm_offline_queue_v1';
+let isOnline = navigator.onLine;
+let flushingQueue = false;
+
 // ── Fase system ─────────────────────────────────────────
 // faseList: ['Standby', 'Perjalanan', 'Aktif Bekerja', 'Selesai']
 const FASE_LIST = ['Standby','Perjalanan','Aktif Bekerja','Selesai'];
@@ -704,10 +721,103 @@ try {
   app = initializeApp(FB_CONFIG);
   db  = getDatabase(app);
   addLog('Firebase terhubung', 'ok');
-  document.getElementById('signal-dot').classList.add('live');
-  document.getElementById('conn-label').textContent = 'Live';
 } catch(e) {
   addLog('Firebase: ' + e.message + ' — mode demo aktif', 'err');
+}
+
+// ── Indikator koneksi real (bukan cuma status Firebase saat load) ──────
+function updateConnUI() {
+  const dot = document.getElementById('signal-dot');
+  const label = document.getElementById('conn-label');
+  if (!dot || !label) return;
+  if (isOnline) {
+    dot.classList.add('live');
+    const n = getOfflineQueue().length;
+    label.textContent = n>0 ? `Online · menyinkron ${n}` : 'Live';
+  } else {
+    dot.classList.remove('live');
+    label.textContent = 'Offline · data disimpan lokal';
+  }
+}
+window.addEventListener('online', () => {
+  isOnline = true;
+  addLog('🌐 Koneksi internet kembali — menyinkronkan data tersimpan...', 'ok');
+  updateConnUI();
+  flushOfflineQueue();
+});
+window.addEventListener('offline', () => {
+  isOnline = false;
+  addLog('📴 Koneksi internet terputus — data GPS & laporan disimpan otomatis di HP, akan terkirim begitu sinyal kembali', 'warn');
+  updateConnUI();
+});
+updateConnUI();
+// Cek ulang tiap 20 detik (jaringan seluler kadang tidak memicu event online/offline dengan akurat)
+setInterval(() => { flushOfflineQueue(); }, 20000);
+
+// ── Utilitas antrian offline (localStorage) ─────────────────────────────
+function getOfflineQueue() {
+  try { return JSON.parse(localStorage.getItem(OFFLINE_QUEUE_KEY) || '[]'); }
+  catch(e) { return []; }
+}
+function saveOfflineQueue(q) {
+  try { localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(q)); } catch(e) { /* storage penuh, abaikan */ }
+}
+function enqueueOffline(item) {
+  const q = getOfflineQueue();
+  q.push(item);
+  // batasi 500 entri terakhir supaya localStorage tidak membengkak
+  while (q.length > 500) q.shift();
+  saveOfflineQueue(q);
+  updateConnUI();
+}
+async function flushOfflineQueue() {
+  if (flushingQueue || !db) return;
+  let q = getOfflineQueue();
+  if (q.length === 0) return;
+  flushingQueue = true;
+  let sent = 0;
+  while (q.length > 0) {
+    const item = q[0];
+    try {
+      if (item.type === 'location') {
+        await set(ref(db, 'petugasHistory/'+item.uid+'/'+item.payload.ts), item.payload);
+        await set(ref(db, 'petugas/'+item.uid), {...item.payload, offlineSync:true});
+      } else if (item.type === 'status') {
+        await set(ref(db, 'petugas/'+item.uid+'/status'), item.payload.status);
+      } else if (item.type === 'absensi') {
+        await set(ref(db, item.path), item.payload);
+      }
+      q.shift();
+      saveOfflineQueue(q);
+      sent++;
+    } catch(e) {
+      // masih gagal (mungkin masih offline) — hentikan, coba lagi nanti
+      break;
+    }
+  }
+  flushingQueue = false;
+  if (sent > 0) addLog(`✓ ${sent} data tersimpan offline berhasil disinkronkan ke server`, 'ok');
+  updateConnUI();
+}
+window.addEventListener('beforeunload', () => { /* queue sudah di localStorage, aman walau app ditutup */ });
+
+// Helper umum: kirim data penting (absensi/laporan) — kalau offline atau gagal,
+// otomatis masuk antrian dan tidak hilang.
+async function safeSet(path, payload, label) {
+  if (!db) return false;
+  if (!isOnline) {
+    enqueueOffline({type:'absensi', path, payload});
+    addLog((label||'Data')+' disimpan offline, akan disinkronkan otomatis','warn');
+    return false;
+  }
+  try {
+    await set(ref(db, path), payload);
+    return true;
+  } catch(e) {
+    enqueueOffline({type:'absensi', path, payload});
+    addLog((label||'Data')+' gagal kirim, disimpan offline: '+e.message,'warn');
+    return false;
+  }
 }
 
 // ════════════════════════════════════════════
@@ -811,6 +921,9 @@ window.doLogin = function() {
   faseCurrent = 0;
   faseLog = [];
   updateFaseHero();
+  const badge0 = document.getElementById('lokasi-mode-badge');
+  if (badge0) { badge0.style.display='none'; badge0.textContent=''; }
+  pilihLokasi('Kantor');
   showScreen('absensi');
   startAbsensiGPS();
   addLog('Login: '+nama+' ('+regu+')', 'ok');
@@ -938,20 +1051,75 @@ window.submitFase = async function() {
       lokasi:absenLokasi
     };
     try {
-      await set(ref(db,'absensi/'+currentUser.id+'_fase0_'+waktu), payload);
-      await set(ref(db,'absensiLog/'+currentUser.id+'/fase0'), payload);
+      await safeSet('absensi/'+currentUser.id+'_fase0_'+waktu, payload, 'Absensi Standby');
+      await safeSet('absensiLog/'+currentUser.id+'/fase0', payload, 'Absensi Standby');
     } catch(e){addLog('Simpan absensi gagal: '+e.message,'err');}
   }
 
   addLog('✓ Absensi Standby tercatat · '+new Date(waktu).toLocaleTimeString('id-ID'),'ok');
 
-  // Standby selesai → langsung masuk tracking. Perjalanan & Aktif Bekerja
-  // diatur otomatis oleh deteksi GPS, tidak perlu absensi foto lagi.
-  faseCurrent = 1;
-  updateTrackingFase();
-  showScreen('tracking');
-  setStatus('Standby');
-  startGPS();
+  if (absenLokasi === 'Lapangan') {
+    // Petugas absen Standby langsung dari lokasi lapangan → tidak perlu menunggu
+    // deteksi GPS "Perjalanan" maupun konfirmasi "Tiba di Lokasi" lagi, karena
+    // selfie + GPS Standby ini SUDAH membuktikan dia berada di lapangan.
+    // Sesi langsung dimulai sebagai Aktif Bekerja.
+    const entryAktif = {
+      fase:'Aktif Bekerja', waktu, lat:entry.lat, lng:entry.lng, acc:entry.acc,
+      fotoBase64:foto, otomatis:true, catatan:'Standby langsung di Lapangan'
+    };
+    faseLog.push(entryAktif);
+
+    if (db && currentUser) {
+      const payloadAktif = {
+        nama:currentUser.nama, nip:currentUser.nip, regu:currentUser.regu, ulp:currentUser.ulp,
+        fase:'Aktif Bekerja', waktu,
+        lat:entry.lat, lng:entry.lng, acc:entry.acc,
+        fotoBase64:foto, lokasi:'Lapangan', otomatis:true,
+        catatan:'Standby langsung di Lapangan'
+      };
+      try {
+        await safeSet('absensi/'+currentUser.id+'_fase2auto_'+waktu, payloadAktif, 'Absensi Aktif Bekerja');
+        await safeSet('absensiLog/'+currentUser.id+'/fase2auto', payloadAktif, 'Absensi Aktif Bekerja');
+      } catch(e){ addLog('Simpan absensi (auto aktif) gagal: '+e.message,'err'); }
+    }
+
+    faseCurrent = 2; // Aktif Bekerja
+    updateTrackingFase();
+    showScreen('tracking');
+    setStatus('Aktif Bekerja');
+    // Aktifkan background GPS tracking (via plugin native Android)
+try {
+  const { BackgroundGeolocation } = await import(
+    '@capacitor-community/background-geolocation'
+  );
+  await BackgroundGeolocation.addWatcher({
+    backgroundMessage: "FFM PLN — GPS tracking aktif",
+    backgroundTitle:   "Tracking Lokasi",
+    requestPermissions: true,
+    stale: false,
+    distanceFilter: 10
+  }, function(loc, err) {
+    if (err) return;
+    // gunakan data lokasi yang sama seperti pushLocation biasa
+    pushLocation({ coords: { latitude: loc.latitude, longitude: loc.longitude,
+      accuracy: loc.accuracy, heading: loc.bearing || 0, speed: loc.speed || 0 } });
+  });
+} catch(e) {
+  // fallback ke GPS browser biasa kalau bukan di Android native
+}
+    startGPS();
+    const badge = document.getElementById('lokasi-mode-badge');
+    if (badge) { badge.style.display='block'; badge.textContent='📍 Mulai Standby langsung di Lapangan — fase Perjalanan dilewati'; }
+    addLog('📍 Lokasi Lapangan terdeteksi saat Standby — sesi langsung Aktif Bekerja','ok');
+  } else {
+    // Standby dari Kantor → alur normal: Perjalanan & Aktif Bekerja
+    // diatur otomatis oleh deteksi GPS, tidak perlu absensi foto lagi.
+    faseCurrent = 1;
+    updateTrackingFase();
+    showScreen('tracking');
+    setStatus('Standby');
+    startGPS();
+  }
 };
 
 // ── Lokasi pilihan ────────────────────────────────────────
@@ -961,6 +1129,12 @@ window.pilihLokasi = function(lok) {
   document.querySelectorAll('.loc-card').forEach(c=>c.classList.remove('selected'));
   const map={'Kantor':'loc-kantor','Lapangan':'loc-lapangan'};
   if(map[lok]) document.getElementById(map[lok]).classList.add('selected');
+  const hint = document.getElementById('loc-hint');
+  if(hint){
+    hint.innerHTML = lok==='Lapangan'
+      ? '📍 <b>Lapangan</b>: kamu sudah berada di lokasi kerja — begitu Standby dikonfirmasi, sesi langsung jadi <b>Aktif Bekerja</b> (tanpa fase Perjalanan).'
+      : '🏢 <b>Kantor</b>: status mulai dari Standby — Perjalanan &amp; Aktif Bekerja terdeteksi otomatis via GPS saat berangkat.';
+  }
 };
 
 
@@ -1127,8 +1301,8 @@ window.submitAbsenTiba = async function() {
 
   if (db && currentUser) {
     try {
-      await set(ref(db,'absensi/'+currentUser.id+'_tiba_'+waktu), {...entry, nama:currentUser.nama, nip:currentUser.nip, regu:currentUser.regu, ulp:currentUser.ulp, lokasi:'Lapangan'});
-      await set(ref(db,'absensiLog/'+currentUser.id+'/tiba_'+waktu), entry);
+      await safeSet('absensi/'+currentUser.id+'_tiba_'+waktu, {...entry, nama:currentUser.nama, nip:currentUser.nip, regu:currentUser.regu, ulp:currentUser.ulp, lokasi:'Lapangan'}, 'Absen Tiba di Lokasi');
+      await safeSet('absensiLog/'+currentUser.id+'/tiba_'+waktu, entry, 'Absen Tiba di Lokasi');
     } catch(e) { addLog('Simpan absen tiba gagal: '+e.message,'err'); }
   }
 
@@ -1178,15 +1352,22 @@ function pushLocation(pos) {
   if(!currentUser) return;
   const {latitude:lat,longitude:lng,accuracy:acc,heading,speed}=pos.coords;
   const payload={lat,lng,acc:Math.round(acc),heading:heading||0,speed:speed?Math.round(speed*3.6):0,status:currentStatus,nama:currentUser.nama,nip:currentUser.nip,regu:currentUser.regu,ulp:currentUser.ulp,ts:Date.now(),fase:FASE_LIST[Math.min(faseCurrent,3)]};
-  if(db){
-    const pr=ref(db,'petugas/'+currentUser.id);
-    set(pr,payload).then(()=>{
-      sendCount++; document.getElementById('send-count').textContent=sendCount;
-      onDisconnect(pr).update({status:'Offline',ts:Date.now()});
-    }).catch(e=>addLog('GPS kirim gagal: '+e.message,'err'));
-  } else {
+
+  if (!isOnline || !db) {
+    enqueueOffline({type:'location', uid:currentUser.id, payload});
     sendCount++; document.getElementById('send-count').textContent=sendCount;
+    return;
   }
+
+  const pr=ref(db,'petugas/'+currentUser.id);
+  set(pr,payload).then(()=>{
+    sendCount++; document.getElementById('send-count').textContent=sendCount;
+    onDisconnect(pr).update({status:'Offline',ts:Date.now()});
+  }).catch(e=>{
+    addLog('GPS kirim gagal, disimpan offline: '+e.message,'warn');
+    enqueueOffline({type:'location', uid:currentUser.id, payload});
+    sendCount++; document.getElementById('send-count').textContent=sendCount;
+  });
 }
 
 // ════════════════════════════════════════════
@@ -1201,7 +1382,13 @@ window.setStatus = function(s) {
   if(key) document.getElementById('sb-'+key).classList.add('selected');
   const sabDot=document.getElementById('sab-dot');
   if(sabDot){const colors={'Aktif Bekerja':'#22A64A','Perjalanan':'#FFB800','Standby':'#0057B8','Offline':'#E03131'};sabDot.style.background=colors[s]||'#22A64A';}
-  if(db&&currentUser)set(ref(db,'petugas/'+currentUser.id+'/status'),s);
+  if (currentUser) {
+    if (isOnline && db) {
+      set(ref(db,'petugas/'+currentUser.id+'/status'),s).catch(()=>enqueueOffline({type:'status', uid:currentUser.id, payload:{status:s}}));
+    } else if (db) {
+      enqueueOffline({type:'status', uid:currentUser.id, payload:{status:s}});
+    }
+  }
   addLog('Status: '+s,'info');
   if(lastPos)pushLocation(lastPos);
 };
@@ -1359,7 +1546,7 @@ window.submitLaporan = async function() {
 
   progEl.textContent= isRevisi ? 'Mengirim ulang laporan...' : 'Menyimpan laporan...';
   if(db){
-    try{ await set(ref(db,'laporan/'+key), laporan); pantauStatusLaporan(key); }
+    try{ await safeSet('laporan/'+key, laporan, 'Laporan Pekerjaan'); pantauStatusLaporan(key); }
     catch(e){addLog('Laporan gagal: '+e.message,'err');}
   }
 
@@ -1529,10 +1716,10 @@ window.submitSelesai = async function() {
 
   if(db&&currentUser){
     try{
-      await set(ref(db,'absensi/'+currentUser.id+'_faseSelesai_'+waktu),{...entry,nama:currentUser.nama,nip:currentUser.nip,regu:currentUser.regu,ulp:currentUser.ulp,lokasi:'Selesai'});
-      await set(ref(db,'absensiLog/'+currentUser.id+'/faseSelesai'),entry);
-      await set(ref(db,'rekapHarian/'+currentUser.id+'_'+waktu),rekap);
-      await set(ref(db,'petugas/'+currentUser.id+'/status'),'Offline');
+      await safeSet('absensi/'+currentUser.id+'_faseSelesai_'+waktu,{...entry,nama:currentUser.nama,nip:currentUser.nip,regu:currentUser.regu,ulp:currentUser.ulp,lokasi:'Selesai'}, 'Absen Selesai Bertugas');
+      await safeSet('absensiLog/'+currentUser.id+'/faseSelesai', entry, 'Absen Selesai Bertugas');
+      await safeSet('rekapHarian/'+currentUser.id+'_'+waktu, rekap, 'Rekap Harian');
+      await safeSet('petugas/'+currentUser.id+'/status', 'Offline', 'Status Selesai');
     }catch(e){addLog('Laporan akhir gagal: '+e.message,'err');}
   }
 
@@ -1558,6 +1745,16 @@ window.navTab = function(el, tab) {
   else if(tab==='log') document.getElementById('log-list').closest('.card').scrollIntoView({behavior:'smooth',block:'start'});
   else document.getElementById('screen-tracking').scrollTo({top:0,behavior:'smooth'});
 };
+
+// ── Service Worker: supaya aplikasi tetap bisa DIBUKA walau HP sedang
+//    tanpa sinyal (file sw.js wajib ada di folder yang sama dengan petugas.html) ──
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('./sw.js')
+      .then(() => addLog('Mode offline aktif (app-shell tersimpan di HP)','ok'))
+      .catch((e) => addLog('Service worker gagal aktif: '+e.message,'warn'));
+  });
+}
 </script>
 </body>
 </html>
